@@ -34,6 +34,7 @@ jobs:
         run: |
           python /tmp/scm_scan.py \
             --source-path . \
+            --create-fix-pr
             | tee scan_result.txt
 
       - name: Publish scan result to job summary
