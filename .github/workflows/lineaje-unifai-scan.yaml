@@ -23,6 +23,7 @@ jobs:
         run: |
           # Preserve the scanner before removing .github from scan input
           cp .github/scm_scan.py /tmp/scm_scan.py
+          cp .github/scm_client.py /tmp/scm_client.py
 
           # Exclude GitHub config/workflows/scripts from the scan
           rm -rf .github
