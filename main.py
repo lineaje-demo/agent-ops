@@ -24,8 +24,9 @@ import os
 import sys
 import json
 import logging
+import re
 from datetime import datetime
-from typing import Optional, Dict, Tuple
+from typing import Any, Optional, Dict, Tuple
 
 try:
     import requests
@@ -47,6 +48,44 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def _sanitize_mcp_value(value: Any, max_length: int = 2048) -> Any:
+    """Sanitize a value returned from an MCP server to prevent injection attacks."""
+    if value is None:
+        return value
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value
+    if isinstance(value, str):
+        # Remove control characters (except common whitespace) to prevent log injection
+        sanitized = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', value)
+        # Truncate to max length
+        if len(sanitized) > max_length:
+            sanitized = sanitized[:max_length] + '...[truncated]'
+        return sanitized
+    if isinstance(value, dict):
+        return {_sanitize_mcp_value(k, 256): _sanitize_mcp_value(v, max_length) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_sanitize_mcp_value(item, max_length) for item in value[:100]]
+    # For unexpected types, convert to string and sanitize
+    return _sanitize_mcp_value(str(value), max_length)
+
+
+def _validate_mcp_delete_result(result: Any) -> Dict:
+    """Validate and sanitize the result from MCP deleteFile tool."""
+    if result is None:
+        raise ValueError("MCP deleteFile returned None result")
+    # If result is not a dict, wrap it
+    if not isinstance(result, dict):
+        result = {"raw_response": result}
+    # Sanitize all values in the result
+    sanitized = _sanitize_mcp_value(result)
+    # Validate expected fields if present
+    if 'status' in sanitized and sanitized['status'] not in (None, 'success', 'error', 'deleted', 'not_found', True, False):
+        logger.warning("MCP deleteFile returned unexpected status value: %s", repr(sanitized['status'])[:200])
+    return sanitized
+
+
 class FileManagementAgent:
     """Agent for file retrieval, deletion, and record management."""
     
@@ -58,6 +97,36 @@ class FileManagementAgent:
     API_TIMEOUT = 30  # seconds
     MAX_FILE_SIZE = 10 * 1024 * 1024  # 10 MB
     
+    @staticmethod
+    def _sanitize_log_value(value) -> str:
+        """Sanitize a value for safe logging, removing newlines and control characters."""
+        sanitized = str(value)
+        sanitized = re.sub(r'[\r\n]', ' ', sanitized)
+        sanitized = re.sub(r'[\x00-\x1f\x7f-\x9f]', '', sanitized)
+        return sanitized[:200]  # Truncate to prevent log flooding
+
+    @staticmethod
+    def _validate_id(value, name: str) -> int:
+        """Validate that a value is a positive integer ID.
+        
+        Args:
+            value: The value to validate
+            name: Name of the parameter (for error messages)
+            
+        Returns:
+            The validated integer ID
+            
+        Raises:
+            ValueError: If the value is not a valid positive integer
+        """
+        try:
+            int_val = int(value)
+        except (TypeError, ValueError):
+            raise ValueError(f"{name} must be a valid integer")
+        if int_val <= 0:
+            raise ValueError(f"{name} must be a positive integer")
+        return int_val
+
     def __init__(self, dry_run: bool = True):
         """
         Initialize the agent.
@@ -93,10 +162,17 @@ class FileManagementAgent:
             Tuple of (success, content, error_message)
         """
         operation = "get_file"
-        logger.info(f"Attempting to retrieve file with ID: {file_id}")
+        try:
+            validated_file_id = self._validate_id(file_id, "file_id")
+        except ValueError as e:
+            error = str(e)
+            self.log_operation(operation, "failed", {"error": error})
+            return False, None, error
+
+        logger.info("Attempting to retrieve file with ID: %s", self._sanitize_log_value(validated_file_id))
         
         try:
-            url = f"{self.GET_FILE_API}?id={file_id}"
+            url = f"{self.GET_FILE_API}?{urlencode({'id': validated_file_id})}"
             
             if self.dry_run:
                 logger.info(f"DRY RUN: Would call GET {url}")
@@ -207,7 +283,13 @@ class FileManagementAgent:
         logger.info(f"Attempting to purge records with ID: {record_id}")
         
         try:
-            url = f"{self.PURGE_RECORDS_API}?id={record_id}"
+            try:
+                validated_record_id = self._validate_id(record_id, "record_id")
+            except ValueError as e:
+                error = str(e)
+                self.log_operation(operation, "failed", {"error": error})
+                return False, error
+            url = f"{self.PURGE_RECORDS_API}?{urlencode({'id': validated_record_id})}"
             
             if self.dry_run:
                 logger.info(f"DRY RUN: Would call GET {url}")
