@@ -71,6 +71,105 @@ class FileManagementAgent:
         if dry_run:
             logger.warning("Agent running in DRY RUN mode - no actual changes will be made")
     
+    # Maximum allowed length for string fields in MCP responses
+    MCP_MAX_STRING_LENGTH = 4096
+    # Allowed keys in MCP deleteFile response
+    MCP_DELETE_ALLOWED_KEYS = {'status', 'message', 'file_id', 'success', 'error', 'deleted', 'result', 'id', 'detail', 'details'}
+
+    def _validate_and_sanitize_mcp_response(self, response, tool_name: str):
+        """
+        Validate and sanitize output received from an MCP server tool call.
+
+        - Rejects None or unexpected types.
+        - Strips unknown keys from dict responses.
+        - Truncates oversized string values.
+        - Removes embedded control characters from strings.
+
+        Args:
+            response: The raw response from the MCP tool.
+            tool_name: Name of the MCP tool (for logging).
+
+        Returns:
+            Sanitized response (dict or str).
+
+        Raises:
+            ValueError: If the response fails validation.
+        """
+        import re
+
+        if response is None:
+            raise ValueError(f"MCP tool '{tool_name}' returned None response")
+
+        # If the response is a string, sanitize it directly
+        if isinstance(response, str):
+            sanitized = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', response)
+            if len(sanitized) > self.MCP_MAX_STRING_LENGTH:
+                logger.warning(f"MCP '{tool_name}' response string truncated from {len(sanitized)} chars")
+                sanitized = sanitized[:self.MCP_MAX_STRING_LENGTH]
+            return sanitized
+
+        if isinstance(response, bool):
+            return response
+
+        if isinstance(response, (int, float)):
+            return response
+
+        if isinstance(response, dict):
+            # Filter to only allowed keys
+            unknown_keys = set(response.keys()) - self.MCP_DELETE_ALLOWED_KEYS
+            if unknown_keys:
+                logger.warning(
+                    f"MCP '{tool_name}' response contained unexpected keys "
+                    f"(removed): {unknown_keys}"
+                )
+            sanitized_dict = {}
+            for key in response:
+                if key not in self.MCP_DELETE_ALLOWED_KEYS:
+                    continue
+                value = response[key]
+                if isinstance(value, str):
+                    # Remove control characters
+                    value = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', value)
+                    if len(value) > self.MCP_MAX_STRING_LENGTH:
+                        logger.warning(
+                            f"MCP '{tool_name}' field '{key}' truncated from {len(value)} chars"
+                        )
+                        value = value[:self.MCP_MAX_STRING_LENGTH]
+                elif not isinstance(value, (bool, int, float, type(None))):
+                    # Reject complex nested types to prevent injection
+                    logger.warning(
+                        f"MCP '{tool_name}' field '{key}' has disallowed type "
+                        f"{type(value).__name__}, converting to string"
+                    )
+                    value = str(value)[:self.MCP_MAX_STRING_LENGTH]
+                sanitized_dict[key] = value
+            return sanitized_dict
+
+        # Reject any other unexpected types (lists, objects, etc.)
+        raise ValueError(
+            f"MCP tool '{tool_name}' returned unexpected type: {type(response).__name__}"
+        )
+
+    @staticmethod
+    def _sanitize_log(value) -> str:
+        """Sanitize a value for safe inclusion in log messages."""
+        s = str(value)
+        # Strip newlines, carriage returns, and other control characters to prevent log injection
+        s = re.sub(r'[\r\n\x00-\x1f\x7f]', '', s)
+        return s
+
+    @staticmethod
+    def _validate_id(value, name: str) -> int:
+        """Validate that a value is a safe integer ID."""
+        if not isinstance(value, int):
+            try:
+                value = int(value)
+            except (TypeError, ValueError):
+                raise ValueError(f"Invalid {name}: must be an integer")
+        if value < 0:
+            raise ValueError(f"Invalid {name}: must be non-negative")
+        return value
+
     def log_operation(self, operation: str, status: str, details: Dict):
         """Log operation for audit trail."""
         log_entry = {
@@ -80,7 +179,9 @@ class FileManagementAgent:
             'details': details
         }
         self.operations_log.append(log_entry)
-        logger.info(f"Operation: {operation} - Status: {status}")
+        safe_op = self._sanitize_log(operation)
+        safe_status = self._sanitize_log(status)
+        logger.info("Operation: %s - Status: %s", safe_op, safe_status)
     
     def get_file_from_api(self, file_id: int) -> Tuple[bool, Optional[str], Optional[str]]:
         """
@@ -93,13 +194,20 @@ class FileManagementAgent:
             Tuple of (success, content, error_message)
         """
         operation = "get_file"
-        logger.info(f"Attempting to retrieve file with ID: {file_id}")
+        try:
+            file_id = self._validate_id(file_id, "file_id")
+        except ValueError as e:
+            error = str(e)
+            self.log_operation("get_file", "failed", {"error": error})
+            return False, None, error
+
+        logger.info("Attempting to retrieve file with ID: %s", self._sanitize_log(file_id))
         
         try:
-            url = f"{self.GET_FILE_API}?id={file_id}"
+            url = self.GET_FILE_API + "?" + urllib.parse.urlencode({"id": file_id})
             
             if self.dry_run:
-                logger.info(f"DRY RUN: Would call GET {url}")
+                logger.info("DRY RUN: Would call GET %s", self._sanitize_log(url))
                 self.log_operation(operation, "simulated", {"url": url, "file_id": file_id})
                 return True, "DRY_RUN_CONTENT", None
             
