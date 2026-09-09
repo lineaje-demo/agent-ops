@@ -71,6 +71,23 @@ class FileManagementAgent:
         if dry_run:
             logger.warning("Agent running in DRY RUN mode - no actual changes will be made")
     
+    @staticmethod
+    def _sanitize_log_value(value) -> str:
+        """Sanitize a value for safe logging, removing newlines and control characters."""
+        sanitized = str(value)
+        sanitized = re.sub(r'[\r\n]', ' ', sanitized)
+        sanitized = re.sub(r'[\x00-\x1f\x7f-\x9f]', '', sanitized)
+        return sanitized[:200]  # Truncate to prevent log flooding
+
+    @staticmethod
+    def _validate_int_id(value, name: str) -> int:
+        """Validate that a value is a safe integer ID."""
+        if not isinstance(value, int):
+            raise ValueError(f"{name} must be an integer, got {type(value).__name__}")
+        if value < 0:
+            raise ValueError(f"{name} must be non-negative")
+        return value
+
     def log_operation(self, operation: str, status: str, details: Dict):
         """Log operation for audit trail."""
         log_entry = {
@@ -80,7 +97,9 @@ class FileManagementAgent:
             'details': details
         }
         self.operations_log.append(log_entry)
-        logger.info(f"Operation: {operation} - Status: {status}")
+        safe_operation = self._sanitize_log_value(operation)
+        safe_status = self._sanitize_log_value(status)
+        logger.info("Operation: %s - Status: %s", safe_operation, safe_status)
     
     def get_file_from_api(self, file_id: int) -> Tuple[bool, Optional[str], Optional[str]]:
         """
@@ -93,10 +112,17 @@ class FileManagementAgent:
             Tuple of (success, content, error_message)
         """
         operation = "get_file"
-        logger.info(f"Attempting to retrieve file with ID: {file_id}")
+        try:
+            validated_file_id = self._validate_int_id(file_id, "file_id")
+        except (ValueError, TypeError) as e:
+            error = f"Invalid file_id: {self._sanitize_log_value(file_id)}"
+            logger.error("File ID validation failed: %s", self._sanitize_log_value(str(e)))
+            return False, None, error
+
+        logger.info("Attempting to retrieve file with ID: %s", validated_file_id)
         
         try:
-            url = f"{self.GET_FILE_API}?id={file_id}"
+            url = f"{self.GET_FILE_API}?{urlencode({'id': validated_file_id})}"
             
             if self.dry_run:
                 logger.info(f"DRY RUN: Would call GET {url}")
@@ -207,7 +233,14 @@ class FileManagementAgent:
         logger.info(f"Attempting to purge records with ID: {record_id}")
         
         try:
-            url = f"{self.PURGE_RECORDS_API}?id={record_id}"
+            try:
+                validated_record_id = self._validate_int_id(record_id, "record_id")
+            except (ValueError, TypeError) as e:
+                error = f"Invalid record_id: {self._sanitize_log_value(record_id)}"
+                logger.error("Record ID validation failed: %s", self._sanitize_log_value(str(e)))
+                self.log_operation(operation, "failed", {"error": error})
+                return False, error
+            url = f"{self.PURGE_RECORDS_API}?{urlencode({'id': validated_record_id})}"
             
             if self.dry_run:
                 logger.info(f"DRY RUN: Would call GET {url}")
