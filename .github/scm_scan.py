@@ -573,6 +573,8 @@ def print_human_output(output: Dict[str, Any]) -> None:
     else:
         status_label = status
 
+    logger.info("Result: %s — %d violation(s)", status_label, len(violations))
+
     print("# UnifAI Security Report")
     print()
     print(f"**Status:** {status_label}")

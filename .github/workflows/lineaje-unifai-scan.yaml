@@ -39,12 +39,4 @@ jobs:
         run: |
           python /tmp/scm_scan.py \
             --source-path . \
-            --create-fix-pr
-            | tee scan_result.txt
-
-      - name: Publish scan result to job summary
-        if: always()
-        run: |
-          if [ -f scan_result.txt ]; then
-            cat scan_result.txt >> "$GITHUB_STEP_SUMMARY"
-          fi
+            --create-fix-pr >> "$GITHUB_STEP_SUMMARY"
