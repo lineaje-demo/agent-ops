@@ -3,6 +3,10 @@ name: Lineaje AI Policy Scan
 on:
   workflow_dispatch:
 
+permissions:
+  contents: write
+  pull-requests: write
+
 jobs:
   lineaje-scan:
     runs-on: ubuntu-latest
