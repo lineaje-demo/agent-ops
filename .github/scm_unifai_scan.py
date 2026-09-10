@@ -1,42 +1,49 @@
 #!/usr/bin/env python3
-"""Lineaje AI Policy Scanner — GitHub Actions edition.
+"""Lineaje UnifAI Policy Scanner — GitHub Actions edition.
 
-Scans already-checked-out source code against Lineaje AI security policies
-and prints results as structured JSON to stdout. Designed to run on a
-GitHub-managed Ubuntu runner where the repository is pre-checked-out.
+Scans already-checked-out source code against Lineaje AI security policies and
+optionally opens a remediation PR built from the ``fix_code`` patches the policy
+engine returns. Designed to run on a GitHub-managed runner where the repository
+is already checked out.
+
+Self-contained: the only SCM code here is a minimal GitHub REST client
+(:class:`GitHubClient`, defined below) covering the branch/commit/PR calls the
+remediation step makes, so this script is the only file a workflow needs to
+copy. Nothing outside the Python stdlib is required beyond the ``mcp`` SDK.
+
+Every file under ``--source-path`` is scanned. There is no exclusion list and no
+special handling for dependency manifests: the walk collects everything it
+finds, splits it into batches of ``UNIFAI_FILE_BATCH_SIZE`` files, and uploads
+each batch archive as-is. Trimming the scan input (e.g. dropping ``.git``) is
+the caller's job — the workflow does it before invoking this script.
 
 Usage::
 
-    python scripts/gha_repo_scan.py --source-path .
+    python scm_unifai_scan.py --source-path . --create-fix-pr
 
-Output (stdout, JSON)::
+Output:
 
-    {
-      "status": "violations_found | compliant | error",
-      "scan_metadata": {
-        "repo": "owner/repo",
-        "branch": "main",
-        "head_sha": "abc1234",
-        "scanned_at": "2026-05-10T10:00:00Z",
-        "files_scanned": 150,
-        "batches": 2,
-        "failed_batches": 0
-      },
-      "report": "...(markdown policy report)...",
-      "violations": [...],
-      "aibom": [...],
-      "scan_errors": []
-    }
+* **stdout** — the markdown policy report. The workflow redirects this into
+  ``$GITHUB_STEP_SUMMARY`` so it renders on the run summary page rather than
+  filling the step log.
+* **stderr** — progress logs, ending with a one-line result such as
+  ``Result: ❌ Not Compliant — 2 violation(s)``.
 
 Required environment variable::
 
     LINEAJE_PAT_TOKEN  — Lineaje refresh token (exchanged for short-lived access tokens)
 
+Optional environment variables::
+
+    GITHUB_TOKEN / GH_TOKEN  — needed by --create-fix-pr to push the branch and open the PR
+    UNIFAI_FILE_BATCH_SIZE   — files per batch (default 100; 0 puts everything in one batch)
+    MCP_SERVER_URL           — override the Lineaje MCP endpoint
+
 Exit codes::
 
-    0 — scan completed (check "status" field)
-    1 — runtime error
-    2 — configuration error (missing LINEAJE_PAT_TOKEN, missing repo/branch)
+    0 — scan completed (see the report for compliance status)
+    1 — runtime error (every batch failed, or an unhandled exception)
+    2 — configuration error (auth failure, missing repo/branch)
 """
 
 from __future__ import annotations
@@ -44,7 +51,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
-import fnmatch
 import json
 import logging
 import os
@@ -69,7 +75,6 @@ logger = logging.getLogger("gha_repo_scan")
 # ===========================================================================
 
 MCP_SERVER_URL = "https://mcp.v2.prod.veedna.com/mcp"
-# MCP_SERVER_URL = "https://mcp.commercialdev.dev.veedna.com/mcp"
 
 MAX_SCAN_WORKERS = 4
 REMEDIATION_BRANCH_PREFIX = "remediation/unifai-gha"
@@ -77,62 +82,127 @@ DEFAULT_UNIFAI_FILE_BATCH_SIZE = 100
 
 _DEFAULT_LINEAJE_TOKEN_REFRESH_SKEW_SEC = 120
 _LINEAJE_NATIVE_RENEW_ACCESS_TOKEN_URL_PROD = (
-    #"https://lineaje-identity-service.commercialdev.dev.veedna.com"
-     "https://lineaje-identity-service.v2.prod.veedna.com"
+    "https://lineaje-identity-service.v2.prod.veedna.com"
     "/lineajeidentity/api/v1/auth/native/renew-access-token"
 )
-#  "https://lineaje-identity-service.v2.prod.veedna.com"
 
-_ARCHIVE_EXCLUDE = {
-    ".git", ".gitignore", ".gitattributes", ".gitmodules", ".hg", ".svn",
-    ".env", ".env.local", ".env.development", ".env.production",
-    "__pycache__", ".pytest_cache", "venv", ".venv", ".venv-scan", "env", ".tox",
-    "htmlcov", ".coverage", ".mypy_cache", ".ruff_cache",
-    "node_modules", ".yarn", ".pnp",
-    "dist", "build", ".next", ".nuxt", "out", "coverage", ".cache",
-    "target", ".gradle", ".m2",
-    "Pods", ".expo",
-    ".idea", ".vscode",
-    ".lineaje-aiepo-security",
-    "migrations", "alembic",
-}
-_ARCHIVE_EXCLUDE_GLOBS = {
-    "*.secret", "*.key", "*.pem", "*.env.*",
-    "*.zip", "*.tar", "*.tar.gz", "*.jar", "*.war", "*.swp", "*.swo",
-    "*.lock", "package-lock.json", "yarn.lock", "Pipfile.lock",
-    "poetry.lock", "Gemfile.lock", "Cargo.lock", "composer.lock",
-    "*.min.js", "*.min.css", "*.map",
-    "*_pb2.py", "*.pb.go", "*.pb.cc", "*.pb.h",
-    "*.snap",
-}
-_BINARY_EXTENSIONS = {
-    ".png", ".jpg", ".jpeg", ".gif", ".ico", ".bmp", ".webp", ".svg",
-    ".woff", ".woff2", ".ttf", ".eot", ".otf",
-    ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
-    ".zip", ".tar", ".gz", ".bz2", ".7z", ".rar",
-    ".exe", ".dll", ".so", ".dylib", ".class", ".jar", ".war",
-    ".pyc", ".pyo", ".o", ".a",
-    ".mp3", ".mp4", ".avi", ".mov", ".wav", ".flac",
-    ".db", ".sqlite", ".sqlite3",
-}
+# ===========================================================================
+# GitHub client — remediation branch, commit, pull request
+#
+# Only the calls _create_fix_pr makes, over urllib.request from the stdlib.
+# ===========================================================================
 
-_MANIFEST_FILE_NAMES: frozenset = frozenset({
-    "requirements.txt", "requirements-dev.txt", "requirements-test.txt",
-    "Pipfile", "Pipfile.lock", "pyproject.toml", "setup.py", "setup.cfg", "poetry.lock",
-    "environment.yml", "environment.yaml",
-    "package.json", "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "bun.lock",
-    "pom.xml", "build.gradle", "build.gradle.kts", "gradle.lockfile",
-    "build.sbt",
-    "Gemfile", "Gemfile.lock",
-    "go.mod", "go.sum",
-    "Cargo.toml", "Cargo.lock",
-    "packages.config", "packages.lock.json", "nuget.config", "Directory.Packages.props",
-    "composer.json", "composer.lock",
-    "Package.swift", "Package.resolved",
-    "pubspec.yaml", "pubspec.lock",
-    "mix.exs", "mix.lock",
-})
-_MANIFEST_GLOB_PATTERNS: tuple = ("*.csproj", "*.fsproj", "*.vbproj", "*.gemspec")
+class GitHubClient:
+    """Minimal GitHub REST API v3 client for opening remediation PRs."""
+
+    DEFAULT_BASE_URL = "https://api.github.com"
+
+    def __init__(self, token: str, base_url: str = DEFAULT_BASE_URL) -> None:
+        self.token = token
+        self.base_url = base_url.rstrip("/")
+
+    def _headers(self) -> Dict[str, str]:
+        return {
+            "Authorization": f"token {self.token}",
+            "Accept": "application/vnd.github.v3+json",
+            "User-Agent": "UniFAI-PR-Scanner/1.0",
+        }
+
+    def _request(
+        self,
+        method: str,
+        path: str,
+        body: Optional[Dict[str, Any]] = None,
+        *,
+        expected_errors: Optional[set] = None,
+    ) -> Any:
+        """Issue an HTTP request and return the decoded JSON.
+
+        *expected_errors* is an optional set of HTTP status codes (e.g. ``{404}``)
+        that the caller expects and will handle — these are logged at DEBUG instead
+        of ERROR so they don't pollute output during normal operation.
+        """
+        url = f"{self.base_url}{path}" if path.startswith("/") else path
+        headers = self._headers()
+
+        data = json.dumps(body).encode() if body else None
+        if data:
+            headers["Content-Type"] = "application/json"
+
+        req = urllib.request.Request(url, data=data, headers=headers, method=method)
+        logger.debug("%s %s", method, url)
+
+        try:
+            with urllib.request.urlopen(req) as resp:
+                resp_bytes = resp.read()
+                if not resp_bytes:
+                    return None
+                return json.loads(resp_bytes)
+        except urllib.error.HTTPError as exc:
+            error_body = exc.read().decode("utf-8", errors="replace")[:500]
+            if expected_errors and exc.code in expected_errors:
+                logger.debug("GitHub API %s %s → %s (expected): %s", method, url, exc.code, error_body)
+            else:
+                logger.error("GitHub API %s %s → %s: %s", method, url, exc.code, error_body)
+            raise
+
+    def create_branch(self, repo: str, branch_name: str, from_sha: str) -> None:
+        self._request("POST", f"/repos/{repo}/git/refs", {
+            "ref": f"refs/heads/{branch_name}",
+            "sha": from_sha,
+        })
+
+    def get_file_blob_sha(self, repo: str, path: str, ref: str) -> Optional[str]:
+        """Return the blob SHA for *path* at *ref*, or None if the file does not exist.
+
+        GitHub requires this SHA when updating an existing file via the Contents API.
+        """
+        encoded_path = urllib.parse.quote(path, safe="/")
+        qref = urllib.parse.quote(ref, safe="")
+        try:
+            data = self._request(
+                "GET",
+                f"/repos/{repo}/contents/{encoded_path}?ref={qref}",
+                expected_errors={404},
+            )
+            if isinstance(data, dict) and data.get("type") == "file" and data.get("sha"):
+                return str(data["sha"])
+            return None
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                return None
+            raise
+
+    def commit_file(
+        self,
+        repo: str,
+        branch: str,
+        path: str,
+        content: bytes,
+        message: str,
+        sha: Optional[str] = None,
+    ) -> str:
+        if sha is None:
+            sha = self.get_file_blob_sha(repo, path, branch)
+        payload: Dict[str, Any] = {
+            "message": message,
+            "content": base64.b64encode(content).decode(),
+            "branch": branch,
+        }
+        if sha:
+            payload["sha"] = sha
+        encoded_path = urllib.parse.quote(path, safe="/")
+        resp = self._request("PUT", f"/repos/{repo}/contents/{encoded_path}", payload)
+        return resp["commit"]["sha"]
+
+    def create_pull_request(self, repo: str, title: str, head: str, base: str, body: str) -> int:
+        resp = self._request("POST", f"/repos/{repo}/pulls", {
+            "title": title,
+            "head": head,
+            "base": base,
+            "body": body,
+        })
+        return resp["number"]
 
 # ===========================================================================
 # Token helpers
@@ -261,31 +331,12 @@ def build_bearer_getter() -> Callable[[], str]:
 # File collection
 # ===========================================================================
 
-def _is_manifest_file(filename: str) -> bool:
-    if filename in _MANIFEST_FILE_NAMES:
-        return True
-    return any(fnmatch.fnmatch(filename, pat) for pat in _MANIFEST_GLOB_PATTERNS)
-
-
 def collect_repo_files(local_path: str) -> List[str]:
+    """Every file under local_path, relative to it. No filtering of any kind."""
     file_list: List[str] = []
-    for root, dirs, filenames in os.walk(local_path):
-        dirs[:] = [
-            d for d in dirs
-            if d not in _ARCHIVE_EXCLUDE
-            and not fnmatch.fnmatch(d, ".venv-*")
-            and not fnmatch.fnmatch(d, "venv-*")
-        ]
+    for root, _dirs, filenames in os.walk(local_path):
         for fname in filenames:
-            full_path = os.path.join(root, fname)
-            rel_path = os.path.relpath(full_path, local_path)
-            ext = pathlib.Path(fname).suffix.lower()
-            if ext in _BINARY_EXTENSIONS:
-                continue
-            if any(fnmatch.fnmatch(rel_path, g) for g in _ARCHIVE_EXCLUDE_GLOBS):
-                continue
-            if any(p in _ARCHIVE_EXCLUDE for p in pathlib.Path(rel_path).parts):
-                continue
+            rel_path = os.path.relpath(os.path.join(root, fname), local_path)
             file_list.append(rel_path.replace("\\", "/"))
     return file_list
 
@@ -309,13 +360,10 @@ def create_batch_archive(
     head_sha: str,
     batch_index: int = 0,
     run_id: str = "",
-    manifest_files: Optional[List[str]] = None,
 ) -> str:
     archive_path = os.path.join(archive_dir, f"repo_scan_batch_{batch_index}.zip")
-    extra_manifests = [m for m in (manifest_files or []) if m not in file_subset]
-    all_files = list(file_subset) + extra_manifests
     with zipfile.ZipFile(archive_path, "w", zipfile.ZIP_DEFLATED) as zf:
-        for rel_path in all_files:
+        for rel_path in file_subset:
             full_path = os.path.join(source_dir, rel_path)
             if os.path.isfile(full_path):
                 zf.write(full_path, rel_path)
@@ -327,14 +375,10 @@ def create_batch_archive(
             "scan_type": "full_repository",
             "batch_index": batch_index,
             "batch_file_count": len(file_subset),
-            "manifest_file_count": len(extra_manifests),
         }
         zf.writestr("user_metadata.json", json.dumps(metadata, indent=2))
     size_kb = os.path.getsize(archive_path) // 1024
-    logger.info(
-        "Batch archive #%d: %d files + %d manifests, %d KB",
-        batch_index, len(file_subset), len(extra_manifests), size_kb,
-    )
+    logger.info("Batch archive #%d: %d files, %d KB", batch_index, len(file_subset), size_kb)
     return archive_path
 
 
@@ -458,7 +502,6 @@ def parallel_batch_scan(
     run_id: str,
     server_url: str,
     bearer_getter: Callable[[], str],
-    manifest_files: Optional[List[str]] = None,
     max_workers: int = MAX_SCAN_WORKERS,
 ) -> Tuple[List[Dict[str, Any]], List[str], List[Dict[str, str]], int, List[str]]:
     all_remediation_actions: List[Dict[str, Any]] = []
@@ -474,7 +517,6 @@ def parallel_batch_scan(
         archive_path = create_batch_archive(
             source_dir, temp_dir, batch_files,
             source_code_repo, branch, head_sha, batch_idx, run_id=run_id,
-            manifest_files=manifest_files,
         )
         result = run_mcp_scan(server_url, bearer_getter, source_code_repo, branch, batch_files, archive_path)
         return batch_idx, result
@@ -781,15 +823,6 @@ def _create_fix_pr(
     failed_files: Optional[List[str]] = None,
 ) -> Tuple[Optional[int], str]:
     """Commit fix_code patches to a remediation branch and open (or refresh) a PR."""
-    try:
-        import sys as _sys
-        import os as _os
-        _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
-        from scm_client import GitHubClient  # type: ignore
-    except ImportError:
-        logger.error("scm_client.py not found — cannot create remediation PR")
-        return None, ""
-
     if not validated_fixes:
         return None, ""
 
@@ -923,14 +956,11 @@ def _execute_scan(args: argparse.Namespace) -> int:
         print_human_output(output)
         return 0
 
-    manifest_files = [f for f in file_list if _is_manifest_file(os.path.basename(f))]
-    code_files = [f for f in file_list if not _is_manifest_file(os.path.basename(f))]
-    scan_files = code_files if code_files else file_list
-    batch_size = _batch_size(len(scan_files))
-    batches = [scan_files[i: i + batch_size] for i in range(0, len(scan_files), batch_size)]
+    batch_size = _batch_size(len(file_list))
+    batches = [file_list[i: i + batch_size] for i in range(0, len(file_list), batch_size)]
     logger.info(
-        "Files: %d total (%d code, %d manifest) → %d batch(es) of ≤%d",
-        len(file_list), len(code_files), len(manifest_files), len(batches), batch_size,
+        "Files: %d total → %d batch(es) of ≤%d",
+        len(file_list), len(batches), batch_size,
     )
 
     # Step 2: MCP scan
@@ -945,7 +975,6 @@ def _execute_scan(args: argparse.Namespace) -> int:
             run_id=run_id,
             server_url=server_url,
             bearer_getter=bearer_getter,
-            manifest_files=manifest_files or None,
         )
 
     elapsed = time.perf_counter() - scan_start

@@ -26,17 +26,16 @@ jobs:
       - name: Prepare scanner
         run: |
           # Preserve the scanner before removing .github from scan input
-          cp .github/scm_scan.py /tmp/scm_scan.py
-          cp .github/scm_client.py /tmp/scm_client.py
+          cp .github/scm_unifai_scan.py /tmp/scm_unifai_scan.py
 
-          # Exclude GitHub config/workflows/scripts from the scan
-          rm -rf .github
+          # Exclude GitHub config/workflows/scripts and git internals from the scan
+          rm -rf .github .git
 
       - name: Run Lineaje AI policy scan
         env:
           LINEAJE_PAT_TOKEN: ${{ secrets.LINEAJE_PAT_TOKEN }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          python /tmp/scm_scan.py \
+          python /tmp/scm_unifai_scan.py \
             --source-path . \
             --create-fix-pr >> "$GITHUB_STEP_SUMMARY"
