@@ -2,6 +2,11 @@ name: Lineaje AI Policy Scan
 
 on:
   workflow_dispatch:
+    inputs:
+      create_fix_pr:
+        description: "Open a remediation PR with the suggested fixes"
+        type: boolean
+        default: true
 
 permissions:
   contents: write
@@ -38,4 +43,4 @@ jobs:
         run: |
           python /tmp/scm_unifai_scan.py \
             --source-path . \
-            --create-fix-pr >> "$GITHUB_STEP_SUMMARY"
+            ${{ inputs.create_fix_pr && '--create-fix-pr' || '' }} >> "$GITHUB_STEP_SUMMARY"
